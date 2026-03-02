@@ -1,0 +1,27 @@
+# =============================================
+# Dynamic AI Traffic Flow Optimizer — Backend
+# =============================================
+
+# Web framework & server
+fastapi==0.115.0
+uvicorn[standard]==0.30.0
+
+# Computer Vision & AI
+opencv-python-headless==4.10.0.84
+ultralytics==8.3.0
+numpy>=1.26.0
+
+# WebSocket support
+websockets>=12.0
+
+# Environment variable management
+python-dotenv==1.0.1
+
+# Async utilities
+anyio>=4.0
+
+# Database (lightweight)
+aiosqlite==0.20.0
+
+# Optional: Gemini AI (free tier)
+# google-generativeai>=0.8.0

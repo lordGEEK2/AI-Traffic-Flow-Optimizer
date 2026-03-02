@@ -1,0 +1,38 @@
+# Node.js
+node_modules/
+dist/
+dist-ssr/
+*.local
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+env/
+.env
+
+# Database
+backend/data/*.db
+backend/data/*.sqlite
+backend/data/*.sqlite3
+
+# OS related
+.DS_Store
+Thumbs.db
+
+# IDEs and Editors
+.vscode/
+.idea/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# Logs and databases
+*.log
+signal_state.json
+
+# Sample videos (if large, optional – but usually ignored if downloaded)
+# sample_videos/*.mp4

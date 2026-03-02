@@ -1,0 +1,103 @@
+{
+    "_comment": "Lane ROI configuration. Each lane has a unique ID and polygon vertices in pixel coordinates. Calibrate these to match your camera view. Default values are for a 1280x720 frame.",
+    "frame_width": 1280,
+    "frame_height": 720,
+    "lanes": [
+        {
+            "id": "NORTH",
+            "direction": "N",
+            "description": "Northbound approach lane",
+            "polygon": [
+                [
+                    540,
+                    0
+                ],
+                [
+                    740,
+                    0
+                ],
+                [
+                    700,
+                    320
+                ],
+                [
+                    580,
+                    320
+                ]
+            ],
+            "signal_group": "NS"
+        },
+        {
+            "id": "SOUTH",
+            "direction": "S",
+            "description": "Southbound approach lane",
+            "polygon": [
+                [
+                    540,
+                    720
+                ],
+                [
+                    740,
+                    720
+                ],
+                [
+                    700,
+                    400
+                ],
+                [
+                    580,
+                    400
+                ]
+            ],
+            "signal_group": "NS"
+        },
+        {
+            "id": "EAST",
+            "direction": "E",
+            "description": "Eastbound approach lane",
+            "polygon": [
+                [
+                    1280,
+                    300
+                ],
+                [
+                    1280,
+                    420
+                ],
+                [
+                    760,
+                    380
+                ],
+                [
+                    760,
+                    340
+                ]
+            ],
+            "signal_group": "EW"
+        },
+        {
+            "id": "WEST",
+            "direction": "W",
+            "description": "Westbound approach lane",
+            "polygon": [
+                [
+                    0,
+                    300
+                ],
+                [
+                    0,
+                    420
+                ],
+                [
+                    520,
+                    380
+                ],
+                [
+                    520,
+                    340
+                ]
+            ],
+            "signal_group": "EW"
+        }
+    ]
+}
