@@ -1,16 +1,14 @@
 """
-main.py -- FastAPI Application (Delhi Smart Traffic Platform v3.0)
-===================================================================
-Core application integrating all system components:
-  - VideoSource for real-time camera/RTSP/file ingestion
-  - VehicleDetector + DensityAnalyzer for traffic analysis
-  - EmergencyDetector + GreenCorridorManager for emergency handling
-  - SignalController for traffic signal management
-  - ViolationDetector for traffic rule enforcement
-  - TrafficAnalyzer for advanced analytics and AI reasoning
-  - Database for persistent storage
-  - WebSocket for real-time dashboard updates
-  - REST API for status, config, health, history, violations, analytics
+main.py -- FastAPI Application (ITMS Traffic Platform v4.0)
+============================================================
+Multi-lane video upload + YOLOv8 annotated streaming + ambulance priority.
+
+Core flow:
+  1. User uploads 4 lane videos via /api/upload
+  2. /api/start-processing begins round-robin YOLOv8 analysis
+  3. Annotated frames served via /api/frames/{lane_id}
+  4. Per-lane stats via /api/lane-stats, efficiency via /api/efficiency
+  5. WebSocket for real-time dashboard updates
 """
 
 from __future__ import annotations
@@ -18,17 +16,22 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
+import shutil
 import time
 from contextlib import asynccontextmanager
-from typing import Dict, List, Set
+from pathlib import Path
+from typing import Dict, List, Optional, Set
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query
+import cv2
+import numpy as np
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import Response
 
 from .utils.config import (
     BACKEND_HOST, BACKEND_PORT, FRONTEND_URL, WS_INTERVAL_MS,
-    SIMULATION_MODE, VIDEO_SOURCE_MODE, VIDEO_SOURCE,
-    WEBCAM_INDEX, RTSP_URL, RTSP_TIMEOUT, TARGET_FPS,
+    SIMULATION_MODE, TARGET_FPS,
     DENSITY_THRESHOLD, BASE_GREEN_TIME, MAX_GREEN_TIME, MIN_GREEN_TIME,
     YELLOW_TIME, ALL_RED_TIME, MAX_CYCLE_TIME,
     EMERGENCY_MIN_FRAMES, EMERGENCY_CONF_THRESHOLD,
@@ -37,37 +40,66 @@ from .utils.config import (
     validate_config, load_lane_config,
 )
 from .utils.database import Database
-from .cv_engine.video_source import VideoSource
 from .cv_engine.vehicle_detector import VehicleDetector
 from .cv_engine.emergency_detector import EmergencyDetector
 from .cv_engine.density_analyzer import DensityAnalyzer
-from .cv_engine.violation_detector import ViolationDetector
+from .cv_engine.frame_streamer import FrameStreamer
 from .signal_logic.signal_controller import SignalController
 from .signal_logic.green_corridor import GreenCorridorManager
-from .analytics.traffic_analyzer import TrafficAnalyzer
 
 logger = logging.getLogger("traffic-ai.main")
 
 # ---------------------------------------------------------------------------
+# Upload directory
+# ---------------------------------------------------------------------------
+UPLOAD_DIR = Path(__file__).resolve().parent.parent / "uploads"
+UPLOAD_DIR.mkdir(exist_ok=True)
+
+# ---------------------------------------------------------------------------
 # Global state
 # ---------------------------------------------------------------------------
-video_source: VideoSource | None = None
 detector: VehicleDetector | None = None
 emergency_detector: EmergencyDetector | None = None
 density_analyzer: DensityAnalyzer | None = None
 signal_controller: SignalController | None = None
 corridor_manager: GreenCorridorManager | None = None
-violation_detector: ViolationDetector | None = None
-traffic_analyzer: TrafficAnalyzer | None = None
+frame_streamer: FrameStreamer | None = None
 database: Database | None = None
-weather_state: str = "clear"
 
 connected_clients: Set[WebSocket] = set()
 latest_payload: Dict = {}
 start_time: float = 0.0
 tick_count: int = 0
 processing_task: asyncio.Task | None = None
-ai_paused: bool = False
+processing_active: bool = False
+
+# Per-lane video captures
+lane_captures: Dict[str, cv2.VideoCapture] = {}
+lane_video_paths: Dict[str, str] = {}
+
+# Cumulative per-lane stats
+lane_cumulative: Dict[str, Dict[str, int]] = {}
+lane_ambulance_status: Dict[str, bool] = {}
+lane_ambulance_time: Dict[str, Optional[int]] = {}
+
+# Signal timing history for efficiency comparison
+signal_history: List[Dict] = []
+
+LANE_IDS = ["Lane 1", "Lane 2", "Lane 3", "Lane 4"]
+
+
+def _reset_lane_stats():
+    global lane_cumulative, lane_ambulance_status, lane_ambulance_time
+    for lid in LANE_IDS:
+        lane_cumulative[lid] = {
+            "cars": 0, "buses": 0, "trucks": 0,
+            "motorcycles": 0, "ambulances": 0, "total": 0,
+        }
+        lane_ambulance_status[lid] = False
+        lane_ambulance_time[lid] = None
+
+
+_reset_lane_stats()
 
 
 # ---------------------------------------------------------------------------
@@ -75,13 +107,13 @@ ai_paused: bool = False
 # ---------------------------------------------------------------------------
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global video_source, detector, emergency_detector, density_analyzer
-    global signal_controller, corridor_manager, violation_detector
-    global traffic_analyzer, database, start_time, processing_task
+    global detector, emergency_detector, density_analyzer
+    global signal_controller, corridor_manager, frame_streamer
+    global database, start_time
 
     logger.info("=" * 60)
-    logger.info("  Delhi Smart Traffic Command & Analytics Platform v3.0")
-    logger.info("  Intersection: ITO, Delhi")
+    logger.info("  ITMS — Intelligent Traffic Management System v4.0")
+    logger.info("  Multi-Lane Video Analysis + Ambulance Priority")
     logger.info("=" * 60)
 
     warnings = validate_config()
@@ -90,37 +122,17 @@ async def lifespan(app: FastAPI):
 
     start_time = time.time()
 
-    # Video source
-    mode = VIDEO_SOURCE_MODE if not SIMULATION_MODE else "simulation"
-    video_source = VideoSource(
-        mode=mode, device_index=WEBCAM_INDEX, rtsp_url=RTSP_URL,
-        video_path=VIDEO_SOURCE, target_fps=TARGET_FPS, rtsp_timeout=RTSP_TIMEOUT,
-    )
-    video_source.start()
-
     # Detection modules
     detector = VehicleDetector()
     emergency_detector = EmergencyDetector()
     density_analyzer = DensityAnalyzer()
 
     # Signal control
-    signal_controller = SignalController(intersection_id="ITO-INT-001")
+    signal_controller = SignalController(intersection_id="ITMS-001")
     corridor_manager = GreenCorridorManager()
 
-    # Violation detection (load bus priority lanes from Delhi profile)
-    try:
-        import json as _json
-        from pathlib import Path
-        _profile_path = Path(__file__).resolve().parent.parent / "config" / "city_profile_delhi.json"
-        with open(_profile_path) as _f:
-            _profile = _json.load(_f)
-        bus_lanes = _profile.get("bus_priority_lanes", [])
-    except Exception:
-        bus_lanes = []
-    violation_detector = ViolationDetector(bus_priority_lanes=bus_lanes)
-
-    # Analytics engine
-    traffic_analyzer = TrafficAnalyzer()
+    # Frame streamer
+    frame_streamer = FrameStreamer()
 
     # Database
     database = Database(db_path=DB_PATH)
@@ -128,24 +140,16 @@ async def lifespan(app: FastAPI):
         await database.initialize()
         logger.info("Database connected: %s", DB_PATH)
     except Exception as e:
-        logger.error("Database initialization failed: %s", e)
+        logger.error("Database init failed: %s", e)
         database = None
 
-    processing_task = asyncio.create_task(_processing_loop())
-    logger.info("System ready. Video: %s | Simulation: %s", mode, SIMULATION_MODE)
+    logger.info("System ready. Waiting for video uploads...")
     logger.info("=" * 60)
 
     yield
 
     logger.info("Shutting down...")
-    if processing_task:
-        processing_task.cancel()
-        try:
-            await processing_task
-        except asyncio.CancelledError:
-            pass
-    if video_source:
-        video_source.stop()
+    _close_all_captures()
     if database:
         await database.close()
     for ws in list(connected_clients):
@@ -156,13 +160,20 @@ async def lifespan(app: FastAPI):
     logger.info("Shutdown complete.")
 
 
+def _close_all_captures():
+    for cap in lane_captures.values():
+        if cap and cap.isOpened():
+            cap.release()
+    lane_captures.clear()
+
+
 # ---------------------------------------------------------------------------
 # FastAPI app
 # ---------------------------------------------------------------------------
 app = FastAPI(
-    title="Delhi Smart Traffic Command & Analytics Platform",
-    description="Real-time traffic management with CV-based detection, violation monitoring, and smart signal control for ITO Intersection, Delhi",
-    version="3.0.0",
+    title="ITMS — Intelligent Traffic Management System",
+    description="Multi-lane video upload, YOLOv8 detection, ambulance priority, signal optimization",
+    version="4.0.0",
     lifespan=lifespan,
 )
 
@@ -181,98 +192,151 @@ app.add_middleware(
 
 
 # ---------------------------------------------------------------------------
-# Processing Loop
+# Processing Loop — Round-robin across all 4 lane videos
 # ---------------------------------------------------------------------------
 async def _processing_loop() -> None:
-    global latest_payload, tick_count
+    global latest_payload, tick_count, processing_active, signal_history
 
-    interval = WS_INTERVAL_MS / 1000.0
+    interval = max(WS_INTERVAL_MS / 1000.0, 0.03)
+    lane_frame_indices = {lid: 0 for lid in LANE_IDS}
 
-    while True:
+    while processing_active:
         try:
             tick_count += 1
+            lane_results = {}
+            all_vehicles_this_tick = 0
 
-            # If AI is paused, just send last payload
-            if ai_paused:
-                await asyncio.sleep(interval)
-                continue
+            for lane_id in LANE_IDS:
+                cap = lane_captures.get(lane_id)
+                if not cap or not cap.isOpened():
+                    continue
 
-            # 1. Read frame
-            frame = video_source.read() if video_source else None
+                ret, frame = cap.read()
+                if not ret:
+                    # Loop the video
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                    ret, frame = cap.read()
+                    if not ret:
+                        continue
 
-            # 2. Vehicle detection
-            detection = detector.detect(frame) if detector else {}
+                lane_frame_indices[lane_id] += 1
 
-            # 3. Density analysis
-            density = density_analyzer.analyze(detection) if density_analyzer else {}
+                # YOLOv8 detection
+                detection = detector.detect(frame) if detector else {}
+                vehicles = []
+                for lane_data in detection.get("lanes", []):
+                    vehicles.extend(lane_data.get("vehicles", []))
+                if not vehicles:
+                    # Use all detections (flat list approach)
+                    for lane_data in detection.get("lanes", []):
+                        vehicles.extend(lane_data.get("vehicles", []))
 
-            # 4. Emergency detection
-            emergency = emergency_detector.detect(frame, detection) if emergency_detector else {}
+                # Check for ambulance via emergency detector
+                emergency = emergency_detector.detect(frame, detection) if emergency_detector else {}
+                ambulance_here = emergency.get("emergency_detected", False)
 
-            # 5. Handle emergency events
-            if emergency.get("emergency_detected") and corridor_manager and signal_controller:
-                corridor_manager.activate(
-                    direction=emergency.get("lane_id", "NORTH"),
-                    vehicle_type=emergency.get("vehicle_type", "ambulance"),
-                    controller=signal_controller,
-                    confidence=emergency.get("confidence", 0.0),
-                )
+                # Update cumulative counts
+                vtypes = detection.get("vehicle_types", {})
+                cum = lane_cumulative[lane_id]
+                cum["cars"] += vtypes.get("car", 0)
+                cum["buses"] += vtypes.get("bus", 0)
+                cum["trucks"] += vtypes.get("truck", 0)
+                cum["motorcycles"] += vtypes.get("motorcycle", 0)
+                if ambulance_here:
+                    cum["ambulances"] += 1
+                cum["total"] += detection.get("total_vehicles", 0)
 
-            # 6. Corridor timeout
-            if corridor_manager and signal_controller:
-                corridor_manager.check_timeout(signal_controller)
+                lane_ambulance_status[lane_id] = ambulance_here
 
-            # 7. Signal controller
-            total_pedestrians = detection.get("vehicle_types", {}).get("person", 0)
-            if signal_controller:
-                signal_controller.set_weather(weather_state)
-                intersection = signal_controller.update(density, total_pedestrians)
-            else:
-                intersection = {}
+                # Density for this lane
+                density_count = detection.get("total_vehicles", 0)
+                all_vehicles_this_tick += density_count
 
-            # 8. Violation detection
-            violations = []
-            if violation_detector:
-                violations = violation_detector.detect(
-                    detection, intersection, density, tick_count
-                )
+                # Determine signal color for this lane
+                lane_idx = LANE_IDS.index(lane_id)
+                signal_color = "green" if (tick_count // 20) % 4 == lane_idx else "red"
 
-            # 9. Traffic analytics
-            analytics = {}
-            if traffic_analyzer:
-                analytics = traffic_analyzer.analyze(detection, density, intersection)
+                # Compute dynamic green time
+                green_time = None
+                if signal_color == "green":
+                    green_time = min(MAX_GREEN_TIME, max(MIN_GREEN_TIME,
+                        BASE_GREEN_TIME + (density_count - 5) * 2))
 
-            # 10. Build payload
-            vs_stats = video_source.get_stats() if video_source else {}
-            corridor_status = corridor_manager.get_status() if corridor_manager else {}
-            alerts = corridor_manager.get_alerts(10) if corridor_manager else []
+                if ambulance_here:
+                    signal_color = "green"
+                    green_time = 20
+                    lane_ambulance_time[lane_id] = 20
 
+                # Annotate frame and store
+                if frame_streamer:
+                    all_detections = []
+                    for ld in detection.get("lanes", []):
+                        all_detections.extend(ld.get("vehicles", []))
+                    frame_streamer.annotate_and_store(
+                        lane_id=lane_id,
+                        frame=frame,
+                        detections=all_detections,
+                        density=density_count,
+                        ambulance_detected=ambulance_here,
+                        green_time=green_time,
+                        signal_color=signal_color,
+                    )
+
+                lane_results[lane_id] = {
+                    "density": density_count,
+                    "ambulance": ambulance_here,
+                    "signal": signal_color,
+                    "green_time": green_time,
+                    "vehicle_types": vtypes,
+                    "frame_index": lane_frame_indices[lane_id],
+                }
+
+                # Handle ambulance -> green corridor
+                if ambulance_here and corridor_manager and signal_controller:
+                    direction = lane_id.replace("Lane ", "LANE_")
+                    corridor_manager.activate(
+                        direction="NORTH",
+                        vehicle_type="ambulance",
+                        controller=signal_controller,
+                        confidence=emergency.get("confidence", 0.8),
+                    )
+
+            # Dynamic signal timing for efficiency tracking
+            for lane_id in LANE_IDS:
+                lr = lane_results.get(lane_id, {})
+                density_count = lr.get("density", 0)
+                smart_time = min(MAX_GREEN_TIME, max(MIN_GREEN_TIME,
+                    BASE_GREEN_TIME + (density_count - 5) * 2))
+                signal_history.append({
+                    "lane": lane_id,
+                    "smart_time": smart_time,
+                    "traditional_time": 30,
+                    "tick": tick_count,
+                })
+
+            # Keep only last 1000 signal entries
+            if len(signal_history) > 1000:
+                signal_history = signal_history[-1000:]
+
+            # Build broadcast payload
             payload = {
                 "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
-                "detection": detection,
-                "density": density,
-                "intersection": intersection,
-                "corridor": corridor_status,
-                "video_source": vs_stats,
-                "alerts": alerts,
-                "violations": {
-                    "recent": violations,
-                    "summary": violation_detector.get_summary() if violation_detector else {},
-                },
-                "analytics": analytics,
+                "tick": tick_count,
+                "lanes": lane_results,
+                "cumulative": lane_cumulative,
+                "ambulance_status": lane_ambulance_status,
+                "total_vehicles": all_vehicles_this_tick,
+                "processing": True,
                 "system_health": {
                     "status": "operational",
                     "uptime_seconds": round(time.time() - start_time, 1),
                     "tick_count": tick_count,
                     "active_connections": len(connected_clients),
-                    "video_healthy": video_source.is_healthy if video_source else False,
-                    "database_connected": database is not None,
-                    "ai_paused": ai_paused,
                 },
             }
             latest_payload = payload
 
-            # 11. Broadcast
+            # Broadcast via WebSocket
             if connected_clients:
                 msg = json.dumps(payload)
                 stale = set()
@@ -282,42 +346,6 @@ async def _processing_loop() -> None:
                     except Exception:
                         stale.add(ws)
                 connected_clients.difference_update(stale)
-
-            # 12. Periodic DB writes
-            if database and tick_count % DB_WRITE_INTERVAL == 0:
-                try:
-                    for lane in density.get("lanes", []):
-                        await database.insert_traffic_metric(
-                            lane_id=lane.get("lane_id", ""),
-                            vehicle_count=lane.get("vehicle_count", 0),
-                            density_score=lane.get("smoothed_density", 0.0),
-                            density_level=lane.get("level", "low"),
-                            total_vehicles=detection.get("total_vehicles", 0),
-                            fps=detection.get("fps", 0.0),
-                        )
-                    # Write violations
-                    for v in violations:
-                        await database.insert_violation(v)
-                    # Write health snapshot
-                    health = analytics.get("health", {})
-                    trends = analytics.get("trends", {})
-                    await database.insert_health_snapshot(
-                        health_score=health.get("intersection_health_score", 50),
-                        signal_efficiency=health.get("signal_efficiency", 50),
-                        avg_wait=health.get("avg_wait_time_seconds", 0),
-                        trend=trends.get("congestion_trend", "stable"),
-                        weather=weather_state,
-                    )
-                    await database.insert_health_log(
-                        status="operational",
-                        video_healthy=video_source.is_healthy if video_source else False,
-                        video_mode=vs_stats.get("mode", "simulation"),
-                        fps=detection.get("fps", 0.0),
-                        connections=len(connected_clients),
-                        uptime=round(time.time() - start_time, 1),
-                    )
-                except Exception as e:
-                    logger.debug("DB write error: %s", e)
 
         except asyncio.CancelledError:
             raise
@@ -338,279 +366,222 @@ async def websocket_endpoint(ws: WebSocket):
     try:
         while True:
             data = await ws.receive_text()
+            # Handle any commands from client
             try:
                 cmd = json.loads(data)
-                await _handle_ws_command(cmd)
+                logger.debug("WS command: %s", cmd)
             except json.JSONDecodeError:
                 pass
     except WebSocketDisconnect:
-        pass
-    except Exception:
         pass
     finally:
         connected_clients.discard(ws)
         logger.info("WebSocket client disconnected. Total: %d", len(connected_clients))
 
 
-async def _handle_ws_command(cmd: Dict) -> None:
-    action = cmd.get("action")
-    if action == "trigger_emergency":
-        direction = cmd.get("direction", "NORTH")
-        vehicle_type = cmd.get("vehicle_type", "ambulance")
-        if corridor_manager and signal_controller:
-            corridor_manager.activate(direction, vehicle_type, signal_controller, 1.0)
-            if database:
-                await database.insert_emergency_event(
-                    event_type="manual_trigger", vehicle_type=vehicle_type,
-                    lane_id=direction, intersection_id="ITO-INT-001",
-                )
-    elif action == "clear_emergency":
-        if corridor_manager and signal_controller:
-            corridor_manager.deactivate(signal_controller, reason="manual_clear")
-        if emergency_detector:
-            emergency_detector.clear()
+# ---------------------------------------------------------------------------
+# Video Upload
+# ---------------------------------------------------------------------------
+@app.post("/api/upload")
+async def upload_videos(
+    lane1: UploadFile = File(...),
+    lane2: UploadFile = File(...),
+    lane3: UploadFile = File(...),
+    lane4: UploadFile = File(...),
+):
+    """Upload 4 lane videos for processing."""
+    global processing_active, processing_task
+
+    # Stop any existing processing
+    processing_active = False
+    if processing_task and not processing_task.done():
+        processing_task.cancel()
+        try:
+            await processing_task
+        except (asyncio.CancelledError, Exception):
+            pass
+
+    _close_all_captures()
+    _reset_lane_stats()
+
+    files = {"Lane 1": lane1, "Lane 2": lane2, "Lane 3": lane3, "Lane 4": lane4}
+    saved = {}
+
+    for lane_id, upload in files.items():
+        safe_name = f"{lane_id.replace(' ', '_').lower()}{Path(upload.filename).suffix}"
+        dest = UPLOAD_DIR / safe_name
+        with open(dest, "wb") as f:
+            shutil.copyfileobj(upload.file, f)
+        lane_video_paths[lane_id] = str(dest)
+        saved[lane_id] = str(dest)
+        logger.info("Saved %s -> %s", lane_id, dest)
+
+    return {"status": "uploaded", "files": saved}
+
+
+@app.post("/api/start-processing")
+async def start_processing():
+    """Begin YOLOv8 analysis on uploaded lane videos."""
+    global processing_active, processing_task, tick_count
+
+    if not lane_video_paths:
+        return {"error": "No videos uploaded. Use /api/upload first."}
+
+    # Stop existing task
+    processing_active = False
+    if processing_task and not processing_task.done():
+        processing_task.cancel()
+        try:
+            await processing_task
+        except (asyncio.CancelledError, Exception):
+            pass
+
+    _close_all_captures()
+    tick_count = 0
+
+    # Open video captures
+    for lane_id, path in lane_video_paths.items():
+        cap = cv2.VideoCapture(path)
+        if cap.isOpened():
+            lane_captures[lane_id] = cap
+            logger.info("Opened video for %s: %s", lane_id, path)
+        else:
+            logger.error("Failed to open video for %s: %s", lane_id, path)
+
+    if not lane_captures:
+        return {"error": "No videos could be opened."}
+
+    processing_active = True
+    processing_task = asyncio.create_task(_processing_loop())
+    logger.info("Processing started for %d lanes", len(lane_captures))
+
+    return {"status": "processing", "lanes": list(lane_captures.keys())}
+
+
+@app.post("/api/stop-processing")
+async def stop_processing():
+    """Stop the processing loop."""
+    global processing_active, processing_task
+    processing_active = False
+    if processing_task and not processing_task.done():
+        processing_task.cancel()
+        try:
+            await processing_task
+        except (asyncio.CancelledError, Exception):
+            pass
+    return {"status": "stopped"}
 
 
 # ---------------------------------------------------------------------------
-# REST API — Status
+# Annotated Frame Serving
+# ---------------------------------------------------------------------------
+@app.get("/api/frames/{lane_id}")
+async def get_frame(lane_id: str):
+    """Get the latest annotated JPEG frame for a lane."""
+    # Map lane_id: "1" -> "Lane 1", "Lane 1" -> "Lane 1"
+    if lane_id.isdigit():
+        lane_id = f"Lane {lane_id}"
+
+    if frame_streamer:
+        jpeg = frame_streamer.get_frame(lane_id)
+        if jpeg:
+            return Response(content=jpeg, media_type="image/jpeg")
+        # Return placeholder
+        placeholder = frame_streamer.get_placeholder_frame(lane_id)
+        return Response(content=placeholder, media_type="image/jpeg")
+
+    return Response(content=b"", status_code=404)
+
+
+# ---------------------------------------------------------------------------
+# Lane Stats
+# ---------------------------------------------------------------------------
+@app.get("/api/lane-stats")
+async def get_lane_stats():
+    """Get cumulative vehicle counts per lane."""
+    return {
+        "lanes": lane_cumulative,
+        "ambulance_status": lane_ambulance_status,
+        "ambulance_time": lane_ambulance_time,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Efficiency — Smart vs Traditional
+# ---------------------------------------------------------------------------
+@app.get("/api/efficiency")
+async def get_efficiency():
+    """Get smart vs traditional signal timing comparison."""
+    if not signal_history:
+        return {"lanes": {}, "summary": {}}
+
+    lane_data = {}
+    for lid in LANE_IDS:
+        entries = [s for s in signal_history if s["lane"] == lid]
+        if entries:
+            avg_smart = sum(e["smart_time"] for e in entries[-50:]) / min(len(entries), 50)
+            avg_trad = 30
+            lane_data[lid] = {
+                "smart_avg": round(avg_smart, 1),
+                "traditional_avg": avg_trad,
+                "savings_pct": round((1 - avg_smart / avg_trad) * 100, 1) if avg_trad > 0 else 0,
+            }
+
+    return {"lanes": lane_data}
+
+
+# ---------------------------------------------------------------------------
+# Status & Health
 # ---------------------------------------------------------------------------
 @app.get("/api/status")
 async def get_status():
     return {
-        "status": "running",
-        "version": "3.0.0",
-        "city": "Delhi",
-        "intersection": "ITO-INT-001",
-        "simulation_mode": SIMULATION_MODE,
-        "video_mode": video_source.mode.value if video_source else "simulation",
+        "processing": processing_active,
+        "lanes_loaded": list(lane_captures.keys()),
+        "tick_count": tick_count,
         "uptime_seconds": round(time.time() - start_time, 1),
-        "video_healthy": video_source.is_healthy if video_source else False,
-        "database_connected": database is not None,
-        "active_ws_connections": len(connected_clients),
-        "ai_paused": ai_paused,
+        "connections": len(connected_clients),
     }
 
 
 @app.get("/api/health")
 async def health_check():
-    checks = {
-        "video_source": video_source.is_healthy if video_source else False,
-        "detector": detector is not None,
-        "signal_controller": signal_controller is not None,
-        "violation_detector": violation_detector is not None,
-        "traffic_analyzer": traffic_analyzer is not None,
-        "database": database is not None and database._initialized,
-    }
-    healthy = all(checks.values())
-    return {"healthy": healthy, "checks": checks, "warnings": validate_config()}
-
-
-@app.get("/api/config")
-async def get_config():
-    return {
-        "video_source_mode": VIDEO_SOURCE_MODE,
-        "density_threshold": DENSITY_THRESHOLD,
-        "base_green_time": BASE_GREEN_TIME,
-        "max_green_time": MAX_GREEN_TIME,
-        "min_green_time": MIN_GREEN_TIME,
-        "yellow_time": YELLOW_TIME,
-        "all_red_time": ALL_RED_TIME,
-        "max_cycle_time": MAX_CYCLE_TIME,
-        "ws_interval_ms": WS_INTERVAL_MS,
-        "emergency_min_frames": EMERGENCY_MIN_FRAMES,
-        "emergency_conf_threshold": EMERGENCY_CONF_THRESHOLD,
-        "yolo_model": YOLO_MODEL,
-        "yolo_confidence": YOLO_CONFIDENCE,
-        "simulation_mode": SIMULATION_MODE,
-        "city": "Delhi",
-    }
+    return {"status": "ok", "version": "4.0.0"}
 
 
 @app.get("/api/dashboard")
 async def get_dashboard():
-    return latest_payload or {"message": "No data yet."}
-
-
-@app.get("/api/lanes")
-async def get_lane_config():
-    return load_lane_config()
+    """Return the latest state payload for polling clients."""
+    return latest_payload
 
 
 # ---------------------------------------------------------------------------
-# Emergency Control
+# Emergency Control (manual trigger)
 # ---------------------------------------------------------------------------
 @app.post("/api/emergency/trigger")
 async def trigger_emergency(
-    direction: str = Query("NORTH"), vehicle_type: str = Query("ambulance"),
+    lane: str = Query("Lane 1"),
 ):
+    """Manually trigger ambulance priority for a lane."""
+    lane_ambulance_status[lane] = True
+    lane_ambulance_time[lane] = 20
+
     if corridor_manager and signal_controller:
-        success = corridor_manager.activate(direction, vehicle_type, signal_controller, 1.0)
-        if database:
-            await database.insert_emergency_event(
-                event_type="manual_trigger", vehicle_type=vehicle_type,
-                lane_id=direction, intersection_id="ITO-INT-001",
-            )
-        return {"success": success, "message": f"Emergency {'triggered' if success else 'rejected'}: {vehicle_type} from {direction}"}
-    return {"success": False, "message": "System not ready"}
+        corridor_manager.activate(
+            direction="NORTH",
+            vehicle_type="ambulance",
+            controller=signal_controller,
+            confidence=1.0,
+        )
+    return {"status": "emergency_triggered", "lane": lane}
 
 
 @app.post("/api/emergency/clear")
 async def clear_emergency():
-    if corridor_manager and signal_controller:
-        corridor_manager.deactivate(signal_controller, reason="api_clear")
-    if emergency_detector:
-        emergency_detector.clear()
-    return {"success": True, "message": "Emergency cleared"}
-
-
-# ---------------------------------------------------------------------------
-# Weather Control
-# ---------------------------------------------------------------------------
-@app.post("/api/system/weather")
-async def set_weather(state: str = Query("clear")):
-    global weather_state
-    if state not in ("clear", "rain"):
-        return {"success": False, "message": "Invalid state. Use 'clear' or 'rain'."}
-    weather_state = state
-    return {"success": True, "message": f"Weather updated to {state}"}
-
-
-# ---------------------------------------------------------------------------
-# Operator Controls
-# ---------------------------------------------------------------------------
-@app.post("/api/operator/pause")
-async def pause_ai():
-    global ai_paused
-    ai_paused = True
-    return {"success": True, "message": "AI processing paused"}
-
-
-@app.post("/api/operator/resume")
-async def resume_ai():
-    global ai_paused
-    ai_paused = False
-    return {"success": True, "message": "AI processing resumed"}
-
-
-@app.post("/api/operator/force-signal")
-async def force_signal(direction: str = Query("NORTH"), duration: int = Query(30)):
-    if signal_controller:
-        signal_controller.emergency_preempt(direction)
-        async def _auto_release():
-            await asyncio.sleep(duration)
-            if signal_controller:
-                signal_controller.emergency_release()
-        asyncio.create_task(_auto_release())
-        return {"success": True, "message": f"Signal forced GREEN for {direction} for {duration}s"}
-    return {"success": False, "message": "System not ready"}
-
-
-@app.post("/api/operator/adjust-threshold")
-async def adjust_threshold(threshold: int = Query(60)):
-    import app.utils.config as cfg
-    cfg.DENSITY_THRESHOLD = max(10, min(100, threshold))
-    return {"success": True, "message": f"Density threshold adjusted to {cfg.DENSITY_THRESHOLD}"}
-
-
-# ---------------------------------------------------------------------------
-# Test Mode
-# ---------------------------------------------------------------------------
-@app.post("/api/system/test-emergency")
-async def test_emergency(
-    direction: str = Query("NORTH"), vehicle_type: str = Query("ambulance"),
-    duration_seconds: int = Query(10),
-):
-    if corridor_manager and signal_controller:
-        success = corridor_manager.activate(direction, vehicle_type, signal_controller, 0.99)
-        if not success:
-            return {"success": False, "message": "Cannot trigger (cooldown or already active)"}
-        if database:
-            await database.insert_emergency_event(
-                event_type="test", vehicle_type=vehicle_type,
-                lane_id=direction, intersection_id="ITO-INT-001",
-            )
-        async def _auto_clear():
-            await asyncio.sleep(duration_seconds)
-            if corridor_manager and signal_controller and corridor_manager.is_active:
-                corridor_manager.deactivate(signal_controller, reason="test_auto_clear")
-                if emergency_detector:
-                    emergency_detector.clear()
-        asyncio.create_task(_auto_clear())
-        return {"success": True, "message": f"Test emergency activated: {vehicle_type} from {direction}. Auto-clears in {duration_seconds}s."}
-    return {"success": False, "message": "System not ready"}
-
-
-# ---------------------------------------------------------------------------
-# Violations
-# ---------------------------------------------------------------------------
-@app.get("/api/violations/recent")
-async def get_violations(limit: int = Query(50, le=200)):
-    if database:
-        return await database.get_recent_violations(limit)
-    if violation_detector:
-        return violation_detector.get_recent(limit)
-    return []
-
-
-@app.get("/api/violations/summary")
-async def get_violation_summary():
-    if violation_detector:
-        return violation_detector.get_summary()
-    return {"total_violations": 0, "by_type": {}}
-
-
-# ---------------------------------------------------------------------------
-# Analytics
-# ---------------------------------------------------------------------------
-@app.get("/api/analytics/current")
-async def get_current_analytics():
-    return latest_payload.get("analytics", {})
-
-
-@app.get("/api/analytics/history")
-async def get_analytics_history(limit: int = Query(100, le=500)):
-    if database:
-        return await database.get_health_history(limit)
-    return []
-
-
-@app.get("/api/intersection/health")
-async def get_intersection_health():
-    analytics = latest_payload.get("analytics", {})
-    return {
-        "health": analytics.get("health", {}),
-        "forecast": analytics.get("forecast", {}),
-        "trends": analytics.get("trends", {}),
-    }
-
-
-# ---------------------------------------------------------------------------
-# History
-# ---------------------------------------------------------------------------
-@app.get("/api/history/metrics")
-async def get_metrics_history(limit: int = Query(100, le=500)):
-    if database:
-        return await database.get_recent_metrics(limit)
-    return []
-
-
-@app.get("/api/history/emergencies")
-async def get_emergency_history(limit: int = Query(50, le=200)):
-    if database:
-        return await database.get_recent_emergencies(limit)
-    return []
-
-
-@app.get("/api/history/signals")
-async def get_signal_history(limit: int = Query(100, le=500)):
-    if signal_controller:
-        return signal_controller.get_audit_log(limit)
-    return []
-
-
-@app.get("/api/history/emergencies/today")
-async def get_emergency_count_today():
-    if database:
-        count = await database.get_emergency_count_today()
-        return {"count": count}
-    return {"count": 0}
+    """Clear emergency state."""
+    for lid in LANE_IDS:
+        lane_ambulance_status[lid] = False
+        lane_ambulance_time[lid] = None
+    if corridor_manager:
+        corridor_manager.clear()
+    return {"status": "cleared"}

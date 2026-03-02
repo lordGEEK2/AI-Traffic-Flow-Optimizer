@@ -1,149 +1,183 @@
 import { useState, useEffect } from 'react';
-import { BarChart, Bar, LineChart, Line, XAxis, YAxis, Tooltip, ResponsiveContainer, CartesianGrid, PieChart, Pie, Cell } from 'recharts';
+import { useNavigate } from 'react-router-dom';
+import {
+    BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer
+} from 'recharts';
 
 /**
- * AnalyticsPage -- Intersection Analytics (Page 4).
- * Shows Recharts graphs: hourly traffic, lane utilization, congestion trend, signal efficiency.
+ * AnalyticsPage — Analysis Dashboard
+ * Clean white background. Vehicle count table, density bar chart, efficiency comparison.
  */
-export default function AnalyticsPage({ data }) {
-    const [history, setHistory] = useState([]);
-    const [healthHistory, setHealthHistory] = useState([]);
+export default function AnalyticsPage() {
+    const navigate = useNavigate();
+    const [stats, setStats] = useState(null);
+    const [efficiency, setEfficiency] = useState(null);
 
-    const analytics = data?.analytics || {};
-    const flow = analytics?.flow || {};
-    const health = analytics?.health || {};
-    const trends = analytics?.trends || {};
-
-    // Collect live analytics history
     useEffect(() => {
-        if (health.intersection_health_score != null) {
-            const entry = {
-                time: new Date().toLocaleTimeString('en-IN', { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' }),
-                health: health.intersection_health_score,
-                efficiency: health.signal_efficiency || 50,
-                density: data?.density?.overall_density || 0,
-                vehicles: data?.detection?.total_vehicles || 0,
-                wait: health.avg_wait_time_seconds || 0,
-            };
-            setHistory(prev => [...prev, entry].slice(-30));
-            setHealthHistory(prev => [...prev, entry].slice(-30));
-        }
-    }, [data?.timestamp]);
+        const fetchData = async () => {
+            try {
+                const [statsRes, effRes] = await Promise.all([
+                    fetch('http://localhost:8000/api/lane-stats'),
+                    fetch('http://localhost:8000/api/efficiency'),
+                ]);
+                if (statsRes.ok) setStats(await statsRes.json());
+                if (effRes.ok) setEfficiency(await effRes.json());
+            } catch (err) {
+                console.error('Failed to fetch analytics', err);
+            }
+        };
+        fetchData();
+        const timer = setInterval(fetchData, 3000);
+        return () => clearInterval(timer);
+    }, []);
 
-    // Lane utilization for bar chart
-    const laneUtilization = Object.entries(flow.per_lane_utilization || {}).map(([lane, val]) => ({
-        lane, utilization: val,
-        throughput: flow.per_lane_throughput?.[lane] || 0,
+    const lanes = ['Lane 1', 'Lane 2', 'Lane 3', 'Lane 4'];
+
+    // Vehicle count table data
+    const tableData = lanes.map(lid => {
+        const s = stats?.lanes?.[lid] ?? {};
+        return {
+            lane: lid,
+            cars: s.cars ?? 0,
+            buses: s.buses ?? 0,
+            trucks: s.trucks ?? 0,
+            motorcycles: s.motorcycles ?? 0,
+            ambulances: s.ambulances ?? 0,
+            total: s.total ?? 0,
+        };
+    });
+
+    // Density chart data (use total from stats)
+    const densityData = lanes.map(lid => ({
+        name: lid,
+        density: stats?.lanes?.[lid]?.total ?? 0,
     }));
 
-    // Vehicle type distribution for pie chart
-    const vehicleTypes = Object.entries(data?.detection?.vehicle_types || {}).filter(([, c]) => c > 0).map(([type, count]) => ({ name: type.replace('_', ' '), value: count }));
-    const PIE_COLORS = ['#06b6d4', '#3b82f6', '#f59e0b', '#22c55e', '#a855f7', '#ec4899', '#14b8a6'];
+    // Efficiency chart data
+    const efficiencyData = lanes.map(lid => {
+        const e = efficiency?.lanes?.[lid];
+        return {
+            name: lid,
+            smart: e?.smart_avg ?? 20,
+            traditional: e?.traditional_avg ?? 30,
+        };
+    });
+
+    const sectionStyle = {
+        background: '#fff', borderRadius: '12px', padding: '28px',
+        boxShadow: '0 1px 4px rgba(0,0,0,0.06)', marginBottom: '24px',
+    };
 
     return (
-        <div className="p-4 space-y-4">
-            <div className="flex items-center justify-between">
-                <h2 className="text-sm font-bold text-text-heading uppercase tracking-wider">Intersection Analytics</h2>
-                <span className="text-2xs text-text-muted font-mono">ITO-INT-001 | {trends.is_peak_hour ? 'PEAK HOUR' : 'Normal Hours'}</span>
-            </div>
-
-            {/* Summary Row */}
-            <div className="grid grid-cols-5 gap-3">
-                <SummaryCard label="Health Score" value={health.intersection_health_score ?? '--'} unit="/100" color={health.intersection_health_score >= 70 ? 'text-status-green' : health.intersection_health_score >= 40 ? 'text-status-amber' : 'text-status-red'} />
-                <SummaryCard label="Signal Efficiency" value={health.signal_efficiency?.toFixed?.(0) ?? '--'} unit="%" />
-                <SummaryCard label="Vehicles/Min" value={flow.vehicles_per_minute?.toFixed?.(1) ?? '--'} />
-                <SummaryCard label="Avg Wait" value={health.avg_wait_time_seconds?.toFixed?.(0) ?? '--'} unit="s" />
-                <SummaryCard label="Congestion" value={trends.congestion_trend?.toUpperCase() ?? '--'} color={trends.congestion_trend === 'rising' ? 'text-status-red' : trends.congestion_trend === 'falling' ? 'text-status-green' : 'text-text-muted'} />
-            </div>
-
-            {/* Charts Row 1 */}
-            <div className="grid grid-cols-2 gap-3">
-                {/* Health & Efficiency Trend */}
-                <div className="panel">
-                    <div className="panel-header">Health Score & Signal Efficiency Trend</div>
-                    <div className="p-2" style={{ height: 220 }}>
-                        <ResponsiveContainer width="100%" height="100%">
-                            <LineChart data={healthHistory}>
-                                <CartesianGrid strokeDasharray="3 3" stroke="#1e293b" />
-                                <XAxis dataKey="time" tick={{ fontSize: 9, fill: '#64748b' }} interval="preserveStartEnd" />
-                                <YAxis domain={[0, 100]} tick={{ fontSize: 9, fill: '#64748b' }} />
-                                <Tooltip contentStyle={{ backgroundColor: '#0f172a', border: '1px solid #1e293b', fontSize: 11 }} />
-                                <Line type="monotone" dataKey="health" stroke="#22c55e" strokeWidth={2} dot={false} name="Health" />
-                                <Line type="monotone" dataKey="efficiency" stroke="#3b82f6" strokeWidth={2} dot={false} name="Efficiency" />
-                            </LineChart>
-                        </ResponsiveContainer>
-                    </div>
+        <div style={{
+            minHeight: '100vh', background: '#f5f5f5',
+            fontFamily: "'Inter', 'Segoe UI', sans-serif",
+        }}>
+            {/* Header */}
+            <header style={{
+                padding: '16px 32px', background: '#fff',
+                borderBottom: '1px solid #e0e0e0',
+                display: 'flex', justifyContent: 'space-between', alignItems: 'center',
+            }}>
+                <h1 style={{ fontSize: '22px', fontWeight: 700, color: '#1a1a2e' }}>
+                    Analysis Dashboard
+                </h1>
+                <div style={{ display: 'flex', gap: '12px' }}>
+                    <button
+                        onClick={() => navigate('/dashboard')}
+                        style={{
+                            padding: '8px 20px', borderRadius: '6px', border: 'none',
+                            background: '#3b82f6', color: '#fff', fontWeight: 600,
+                            fontSize: '13px', cursor: 'pointer',
+                        }}
+                    >
+                        Back to Dashboard
+                    </button>
                 </div>
+            </header>
 
-                {/* Lane Utilization Bar */}
-                <div className="panel">
-                    <div className="panel-header">Lane Utilization (%)</div>
-                    <div className="p-2" style={{ height: 220 }}>
-                        <ResponsiveContainer width="100%" height="100%">
-                            <BarChart data={laneUtilization}>
-                                <CartesianGrid strokeDasharray="3 3" stroke="#1e293b" />
-                                <XAxis dataKey="lane" tick={{ fontSize: 10, fill: '#64748b' }} />
-                                <YAxis domain={[0, 100]} tick={{ fontSize: 9, fill: '#64748b' }} />
-                                <Tooltip contentStyle={{ backgroundColor: '#0f172a', border: '1px solid #1e293b', fontSize: 11 }} />
-                                <Bar dataKey="utilization" fill="#3b82f6" radius={[3, 3, 0, 0]} />
-                            </BarChart>
-                        </ResponsiveContainer>
-                    </div>
-                </div>
-            </div>
-
-            {/* Charts Row 2 */}
-            <div className="grid grid-cols-2 gap-3">
-                {/* Congestion Trend */}
-                <div className="panel">
-                    <div className="panel-header">Density & Wait Time Trend</div>
-                    <div className="p-2" style={{ height: 220 }}>
-                        <ResponsiveContainer width="100%" height="100%">
-                            <LineChart data={history}>
-                                <CartesianGrid strokeDasharray="3 3" stroke="#1e293b" />
-                                <XAxis dataKey="time" tick={{ fontSize: 9, fill: '#64748b' }} interval="preserveStartEnd" />
-                                <YAxis tick={{ fontSize: 9, fill: '#64748b' }} />
-                                <Tooltip contentStyle={{ backgroundColor: '#0f172a', border: '1px solid #1e293b', fontSize: 11 }} />
-                                <Line type="monotone" dataKey="density" stroke="#ef4444" strokeWidth={2} dot={false} name="Density %" />
-                                <Line type="monotone" dataKey="wait" stroke="#f59e0b" strokeWidth={2} dot={false} name="Wait (s)" />
-                            </LineChart>
-                        </ResponsiveContainer>
-                    </div>
-                </div>
-
-                {/* Vehicle Distribution Pie */}
-                <div className="panel">
-                    <div className="panel-header">Vehicle Type Distribution (Delhi Mix)</div>
-                    <div className="p-2 flex items-center" style={{ height: 220 }}>
-                        <ResponsiveContainer width="60%" height="100%">
-                            <PieChart>
-                                <Pie data={vehicleTypes} cx="50%" cy="50%" outerRadius={80} dataKey="value" label={({ name, percent }) => `${name} ${(percent * 100).toFixed(0)}%`} labelLine={false} fontSize={9}>
-                                    {vehicleTypes.map((_, i) => <Cell key={i} fill={PIE_COLORS[i % PIE_COLORS.length]} />)}
-                                </Pie>
-                                <Tooltip contentStyle={{ backgroundColor: '#0f172a', border: '1px solid #1e293b', fontSize: 11 }} />
-                            </PieChart>
-                        </ResponsiveContainer>
-                        <div className="flex-1 space-y-1">
-                            {vehicleTypes.map((vt, i) => (
-                                <div key={vt.name} className="flex items-center gap-1.5 text-2xs">
-                                    <div className="w-2 h-2 rounded-sm" style={{ backgroundColor: PIE_COLORS[i % PIE_COLORS.length] }} />
-                                    <span className="text-text-secondary">{vt.name}</span>
-                                    <span className="font-mono ml-auto">{vt.value}</span>
-                                </div>
+            <div style={{ padding: '24px 32px', maxWidth: '1000px', margin: '0 auto' }}>
+                {/* Cumulative Vehicles Passed Table */}
+                <div style={sectionStyle}>
+                    <h2 style={{ fontSize: '18px', fontWeight: 700, color: '#1a1a2e', marginBottom: '4px', textAlign: 'center' }}>
+                        Cumulative Vehicles Passed (Per Lane)
+                    </h2>
+                    <p style={{ color: '#888', fontSize: '13px', textAlign: 'center', marginBottom: '20px' }}>
+                        Total vehicles counted when their lane's light turned red.
+                    </p>
+                    <table style={{ width: '100%', borderCollapse: 'collapse' }}>
+                        <thead>
+                            <tr style={{ borderBottom: '2px solid #e0e0e0' }}>
+                                {['Lane', 'Cars', 'Buses', 'Trucks', 'Motorcycles', 'Ambulances', 'Total'].map(h => (
+                                    <th key={h} style={{
+                                        padding: '10px 16px', textAlign: 'left',
+                                        fontSize: '13px', fontWeight: 700, color: '#444',
+                                    }}>{h}</th>
+                                ))}
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {tableData.map((row, i) => (
+                                <tr key={row.lane} style={{
+                                    borderBottom: '1px solid #eee',
+                                    background: i % 2 === 0 ? '#fff' : '#fafafa',
+                                }}>
+                                    <td style={{ padding: '10px 16px', fontWeight: 600, fontSize: '13px', fontFamily: 'monospace' }}>{row.lane}</td>
+                                    <td style={{ padding: '10px 16px', fontSize: '14px' }}>{row.cars}</td>
+                                    <td style={{ padding: '10px 16px', fontSize: '14px' }}>{row.buses}</td>
+                                    <td style={{ padding: '10px 16px', fontSize: '14px' }}>{row.trucks}</td>
+                                    <td style={{ padding: '10px 16px', fontSize: '14px' }}>{row.motorcycles}</td>
+                                    <td style={{ padding: '10px 16px', fontSize: '14px', color: row.ambulances > 0 ? '#ef4444' : '#888', fontWeight: row.ambulances > 0 ? 700 : 400 }}>
+                                        {row.ambulances}
+                                    </td>
+                                    <td style={{ padding: '10px 16px', fontSize: '14px', fontWeight: 700 }}>{row.total}</td>
+                                </tr>
                             ))}
-                        </div>
-                    </div>
+                        </tbody>
+                    </table>
+                </div>
+
+                {/* Current Traffic Density */}
+                <div style={sectionStyle}>
+                    <h2 style={{ fontSize: '18px', fontWeight: 700, color: '#1a1a2e', marginBottom: '4px', textAlign: 'center' }}>
+                        Current Traffic Density (Live)
+                    </h2>
+                    <p style={{ color: '#888', fontSize: '13px', textAlign: 'center', marginBottom: '20px' }}>
+                        Live snapshot of vehicle count in each lane.
+                    </p>
+                    <ResponsiveContainer width="100%" height={250}>
+                        <BarChart data={densityData}>
+                            <CartesianGrid strokeDasharray="3 3" stroke="#eee" />
+                            <XAxis dataKey="name" fontSize={13} />
+                            <YAxis fontSize={13} />
+                            <Tooltip />
+                            <Legend />
+                            <Bar dataKey="density" fill="#f87171" name="Current Vehicle Density" radius={[4, 4, 0, 0]} />
+                        </BarChart>
+                    </ResponsiveContainer>
+                </div>
+
+                {/* System Efficiency */}
+                <div style={sectionStyle}>
+                    <h2 style={{ fontSize: '18px', fontWeight: 700, color: '#1a1a2e', marginBottom: '4px', textAlign: 'center' }}>
+                        System Efficiency (Smart vs. Traditional)
+                    </h2>
+                    <p style={{ color: '#888', fontSize: '13px', textAlign: 'center', marginBottom: '20px' }}>
+                        Compares the dynamic green light time (Smart) vs. a fixed 30 second timer (Traditional).
+                    </p>
+                    <ResponsiveContainer width="100%" height={300}>
+                        <BarChart data={efficiencyData}>
+                            <CartesianGrid strokeDasharray="3 3" stroke="#eee" />
+                            <XAxis dataKey="name" fontSize={13} />
+                            <YAxis label={{ value: 'Green Light Time (seconds)', angle: -90, position: 'insideLeft', fontSize: 12 }} fontSize={13} />
+                            <Tooltip />
+                            <Legend />
+                            <Bar dataKey="smart" fill="#67e8f9" name="Smart System (Dynamic Time)" radius={[4, 4, 0, 0]} />
+                            <Bar dataKey="traditional" fill="#fca5a5" name="Traditional System (Fixed Time)" radius={[4, 4, 0, 0]} />
+                        </BarChart>
+                    </ResponsiveContainer>
                 </div>
             </div>
-        </div>
-    );
-}
-
-function SummaryCard({ label, value, unit, color }) {
-    return (
-        <div className="panel p-3">
-            <div className="text-2xs text-text-muted font-semibold uppercase tracking-wider mb-1">{label}</div>
-            <div className={`font-mono text-xl font-semibold ${color || 'text-text-heading'}`}>{value}{unit && <span className="text-xs text-text-muted ml-0.5">{unit}</span>}</div>
         </div>
     );
 }
