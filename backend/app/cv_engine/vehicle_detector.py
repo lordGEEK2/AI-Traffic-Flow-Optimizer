@@ -28,12 +28,18 @@ from ..utils.config import (
 logger = logging.getLogger("traffic-ai.vehicle_detector")
 
 # YOLO class IDs for vehicles (COCO dataset)
+# Note: auto_rickshaw and e_rickshaw are mapped as proxies
+# (COCO has no separate class; in production use a custom-trained model)
 VEHICLE_CLASSES: Dict[int, str] = {
+    0: "person",
     2: "car",
     3: "motorcycle",
     5: "bus",
     7: "truck",
 }
+
+# Delhi-specific: Map some motorcycle detections as auto-rickshaw proxy
+DELHI_REMAP_ENABLED = True
 
 
 class VehicleDetector:
@@ -124,7 +130,7 @@ class VehicleDetector:
 
         # Collect all detected vehicles
         all_vehicles: List[Dict] = []
-        vehicle_types: Dict[str, int] = {"car": 0, "truck": 0, "bus": 0, "motorcycle": 0}
+        vehicle_types: Dict[str, int] = {"person": 0, "car": 0, "truck": 0, "bus": 0, "motorcycle": 0, "auto_rickshaw": 0, "e_rickshaw": 0}
 
         for r in results:
             if r.boxes is None:
@@ -190,23 +196,29 @@ class VehicleDetector:
         base = 8 + int(5 * abs(np.sin(self._frame_count * 0.02)))
 
         lanes = []
-        vehicle_types = {"car": 0, "truck": 0, "bus": 0, "motorcycle": 0}
+        vehicle_types = {"person": 0, "car": 0, "truck": 0, "bus": 0, "motorcycle": 0, "auto_rickshaw": 0, "e_rickshaw": 0}
 
         for lane in self._lane_config.get("lanes", []):
             lid = lane["id"]
             variance = random.randint(-3, 5)
             count = max(0, base + variance)
 
-            # Distribute by type
-            cars = int(count * 0.6)
-            trucks = int(count * 0.15)
-            buses = int(count * 0.1)
-            motos = count - cars - trucks - buses
+            # Delhi-realistic distribution
+            cars = int(count * 0.30)
+            motos = int(count * 0.25)
+            autos = int(count * 0.15)
+            buses = int(count * 0.08)
+            trucks = int(count * 0.07)
+            ericks = int(count * 0.05)
+            persons = count - cars - motos - autos - buses - trucks - ericks
 
             vehicle_types["car"] += cars
-            vehicle_types["truck"] += trucks
-            vehicle_types["bus"] += buses
             vehicle_types["motorcycle"] += motos
+            vehicle_types["auto_rickshaw"] += autos
+            vehicle_types["bus"] += buses
+            vehicle_types["truck"] += trucks
+            vehicle_types["e_rickshaw"] += ericks
+            vehicle_types["person"] += max(0, persons)
 
             # Density based on simulated saturation
             density = min(100.0, count * 6.5 + random.uniform(-3, 3))

@@ -44,6 +44,7 @@ class PhaseStage(str, Enum):
     GREEN_ACTIVE = "GREEN_ACTIVE"
     YELLOW_TRANSITION = "YELLOW_TRANSITION"
     ALL_RED_CLEARANCE = "ALL_RED_CLEARANCE"
+    PEDESTRIAN_CROSSING = "PEDESTRIAN_CROSSING"
 
 
 # Direction cycle order for a standard 4-way intersection
@@ -69,6 +70,9 @@ class SignalController:
         self._green_duration: float = float(BASE_GREEN_TIME)
         self._cycle_start: float = time.time()
         self._total_cycle_time: float = 0.0
+
+        # Environmental
+        self._weather: str = "clear"
 
         # Per-direction states
         self._states: Dict[str, SignalState] = {}
@@ -96,7 +100,11 @@ class SignalController:
             intersection_id, " -> ".join(DIRECTION_ORDER),
         )
 
-    def update(self, density_data: Dict) -> Dict:
+    def set_weather(self, weather: str) -> None:
+        """Update environmental weather state."""
+        self._weather = weather
+
+    def update(self, density_data: Dict, total_pedestrians: int = 0) -> Dict:
         """
         Advance the signal controller by one tick.
 
@@ -155,27 +163,40 @@ class SignalController:
                 self._log_transition(current_dir, "YELLOW", "RED", elapsed, 0)
 
         elif self._phase_stage == PhaseStage.ALL_RED_CLEARANCE:
-            if elapsed >= ALL_RED_TIME:
-                # Advance to next direction
-                self._current_index = (self._current_index + 1) % len(DIRECTION_ORDER)
-                next_dir = DIRECTION_ORDER[self._current_index]
+            all_red_duration = ALL_RED_TIME + (2.0 if self._weather == "rain" else 0.0)
+            if elapsed >= all_red_duration:
+                # Inject pedestrian phase if waiting people > 2 at the end of a full cycle
+                if self._current_index == len(DIRECTION_ORDER) - 1 and total_pedestrians > 2:
+                    self._phase_stage = PhaseStage.PEDESTRIAN_CROSSING
+                    self._phase_start = now
+                else:
+                    self._advance_to_next_green(lane_densities, now)
 
-                # Check cycle time cap
-                self._total_cycle_time = now - self._cycle_start
-                if self._current_index == 0:
-                    self._cycle_start = now
-                    self._total_cycle_time = 0.0
-
-                self._phase_stage = PhaseStage.GREEN_ACTIVE
-                self._phase_start = now
-                self._states[next_dir] = SignalState.GREEN
-                density = lane_densities.get(next_dir, 0.0)
-                self._green_duration = self._calc_green_time(density)
-                self._countdowns[next_dir] = round(self._green_duration, 1)
-                self._density_at_green[next_dir] = density
-                self._log_transition(next_dir, "RED", "GREEN", 0, density)
+        elif self._phase_stage == PhaseStage.PEDESTRIAN_CROSSING:
+            if elapsed >= 10.0:  # 10 second crossing time
+                self._advance_to_next_green(lane_densities, now)
 
         return self._build_state(lane_densities)
+
+    def _advance_to_next_green(self, lane_densities: Dict, now: float) -> None:
+        """Reusable method to move from RED to next GREEN phase."""
+        self._current_index = (self._current_index + 1) % len(DIRECTION_ORDER)
+        next_dir = DIRECTION_ORDER[self._current_index]
+
+        # Check cycle time cap
+        self._total_cycle_time = now - self._cycle_start
+        if self._current_index == 0:
+            self._cycle_start = now
+            self._total_cycle_time = 0.0
+
+        self._phase_stage = PhaseStage.GREEN_ACTIVE
+        self._phase_start = now
+        self._states[next_dir] = SignalState.GREEN
+        density = lane_densities.get(next_dir, 0.0)
+        self._green_duration = self._calc_green_time(density)
+        self._countdowns[next_dir] = round(self._green_duration, 1)
+        self._density_at_green[next_dir] = density
+        self._log_transition(next_dir, "RED", "GREEN", 0, density)
 
     def emergency_preempt(self, direction: str) -> None:
         """
@@ -271,6 +292,7 @@ class SignalController:
             "cycle_time": round(self._total_cycle_time, 1),
             "emergency_active": self._emergency_active,
             "emergency_direction": self._emergency_direction,
+            "weather": self._weather,
         }
 
     def _log_transition(

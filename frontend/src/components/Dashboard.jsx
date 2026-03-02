@@ -252,7 +252,7 @@ function DensityChart({ data }) {
 /* --- Utilities --- */
 
 function typeColor(type) {
-    const map = { car: '#3b82f6', truck: '#f59e0b', bus: '#22c55e', motorcycle: '#a855f7' };
+    const map = { person: '#06b6d4', car: '#3b82f6', truck: '#f59e0b', bus: '#22c55e', motorcycle: '#a855f7' };
     return map[type] || '#6b7280';
 }
 

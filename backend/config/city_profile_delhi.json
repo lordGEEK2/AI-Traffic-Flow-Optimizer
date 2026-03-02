@@ -1,0 +1,84 @@
+{
+    "city": "Delhi",
+    "region": "ITO Intersection, Sector 4",
+    "country": "India",
+    "timezone": "Asia/Kolkata",
+    "vehicle_mix": {
+        "car": {
+            "weight": 1.0,
+            "typical_share": 0.30
+        },
+        "motorcycle": {
+            "weight": 0.4,
+            "typical_share": 0.25
+        },
+        "auto_rickshaw": {
+            "weight": 0.6,
+            "typical_share": 0.15
+        },
+        "bus": {
+            "weight": 2.5,
+            "typical_share": 0.08
+        },
+        "truck": {
+            "weight": 2.0,
+            "typical_share": 0.07
+        },
+        "e_rickshaw": {
+            "weight": 0.5,
+            "typical_share": 0.05
+        },
+        "person": {
+            "weight": 0.1,
+            "typical_share": 0.10
+        }
+    },
+    "peak_hours": {
+        "morning": {
+            "start": "08:00",
+            "end": "10:30",
+            "multiplier": 1.4
+        },
+        "afternoon": {
+            "start": "13:00",
+            "end": "14:30",
+            "multiplier": 1.1
+        },
+        "evening": {
+            "start": "17:00",
+            "end": "20:00",
+            "multiplier": 1.5
+        }
+    },
+    "density_thresholds": {
+        "low": 25,
+        "medium": 50,
+        "high": 75,
+        "critical": 90
+    },
+    "bus_priority_lanes": [
+        "SOUTH"
+    ],
+    "pollution_alert": {
+        "enabled": false,
+        "aqi_threshold": 300,
+        "reduce_idle_time": true
+    },
+    "speed_limits_kmph": {
+        "default": 50,
+        "school_zone": 30,
+        "highway": 80
+    },
+    "intersection_config": {
+        "id": "ITO-INT-001",
+        "name": "ITO Intersection",
+        "directions": [
+            "NORTH",
+            "SOUTH",
+            "EAST",
+            "WEST"
+        ],
+        "pedestrian_crossings": true,
+        "bus_stop_near": "SOUTH"
+    }
+}

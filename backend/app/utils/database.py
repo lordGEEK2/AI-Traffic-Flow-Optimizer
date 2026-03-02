@@ -77,10 +77,45 @@ CREATE TABLE IF NOT EXISTS system_health_logs (
     error_message TEXT
 );
 
+CREATE TABLE IF NOT EXISTS violation_logs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp TEXT NOT NULL,
+    violation_type TEXT NOT NULL,
+    lane_id TEXT,
+    vehicle_class TEXT,
+    confidence REAL DEFAULT 0.0,
+    description TEXT,
+    frame_number INTEGER DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS hourly_traffic_summary (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp TEXT NOT NULL,
+    hour TEXT NOT NULL,
+    total_vehicles INTEGER DEFAULT 0,
+    avg_density REAL DEFAULT 0.0,
+    health_score INTEGER DEFAULT 50,
+    peak_density REAL DEFAULT 0.0,
+    violations_count INTEGER DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS intersection_health_history (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp TEXT NOT NULL,
+    health_score INTEGER DEFAULT 50,
+    signal_efficiency REAL DEFAULT 50.0,
+    avg_wait_time REAL DEFAULT 0.0,
+    congestion_trend TEXT DEFAULT 'stable',
+    weather TEXT DEFAULT 'clear'
+);
+
 CREATE INDEX IF NOT EXISTS idx_traffic_ts ON traffic_metrics(timestamp);
 CREATE INDEX IF NOT EXISTS idx_emergency_ts ON emergency_events(timestamp);
 CREATE INDEX IF NOT EXISTS idx_signal_ts ON signal_history(timestamp);
 CREATE INDEX IF NOT EXISTS idx_health_ts ON system_health_logs(timestamp);
+CREATE INDEX IF NOT EXISTS idx_violation_ts ON violation_logs(timestamp);
+CREATE INDEX IF NOT EXISTS idx_hourly_ts ON hourly_traffic_summary(timestamp);
+CREATE INDEX IF NOT EXISTS idx_intersection_ts ON intersection_health_history(timestamp);
 """
 
 
@@ -285,6 +320,58 @@ class Database:
         )
         row = await cursor.fetchone()
         return row[0] if row else 0
+
+    # ------------------------------------------------------------------
+    # Violations
+    # ------------------------------------------------------------------
+    async def insert_violation(self, violation: Dict) -> None:
+        """Insert a traffic violation."""
+        if not self._initialized:
+            return
+        ts = violation.get("timestamp", datetime.now(timezone.utc).isoformat())
+        await self._conn.execute(
+            "INSERT INTO violation_logs (timestamp, violation_type, lane_id, vehicle_class, confidence, description, frame_number) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (ts, violation.get("violation_type", ""), violation.get("lane_id", ""),
+             violation.get("vehicle_class", ""), violation.get("confidence", 0),
+             violation.get("description", ""), violation.get("frame_number", 0)),
+        )
+        await self._conn.commit()
+
+    async def get_recent_violations(self, limit: int = 50) -> List[Dict]:
+        """Get recent violations."""
+        if not self._initialized:
+            return []
+        cursor = await self._conn.execute(
+            "SELECT * FROM violation_logs ORDER BY id DESC LIMIT ?", (limit,)
+        )
+        cols = [d[0] for d in cursor.description]
+        rows = await cursor.fetchall()
+        return [dict(zip(cols, row)) for row in rows]
+
+    # ------------------------------------------------------------------
+    # Intersection Health History
+    # ------------------------------------------------------------------
+    async def insert_health_snapshot(self, health_score: int,
+                                      signal_efficiency: float, avg_wait: float,
+                                      trend: str, weather: str) -> None:
+        if not self._initialized:
+            return
+        ts = datetime.now(timezone.utc).isoformat()
+        await self._conn.execute(
+            "INSERT INTO intersection_health_history (timestamp, health_score, signal_efficiency, avg_wait_time, congestion_trend, weather) VALUES (?, ?, ?, ?, ?, ?)",
+            (ts, health_score, round(signal_efficiency, 1), round(avg_wait, 1), trend, weather),
+        )
+        await self._conn.commit()
+
+    async def get_health_history(self, limit: int = 100) -> List[Dict]:
+        if not self._initialized:
+            return []
+        cursor = await self._conn.execute(
+            "SELECT * FROM intersection_health_history ORDER BY id DESC LIMIT ?", (limit,)
+        )
+        cols = [d[0] for d in cursor.description]
+        rows = await cursor.fetchall()
+        return [dict(zip(cols, row)) for row in rows]
 
 
 def _classify(density: float) -> str:

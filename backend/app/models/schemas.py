@@ -93,6 +93,7 @@ class IntersectionState(BaseModel):
     cycle_time: float = 0.0
     emergency_active: bool = False
     emergency_direction: Optional[str] = None
+    weather: str = "clear"
 
 
 # ---------------------------------------------------------------------------
